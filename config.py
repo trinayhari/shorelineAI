@@ -23,12 +23,12 @@ WEB_PAGE_EXTENSIONS = ['.html', '.htm', '.php', '.asp', '.aspx', '.jsp', '.cfm']
 ZONING_FILE_KEYWORDS = ['zoning', 'regulation', 'ordinance', 'code']
 
 # LLM Configuration
-LLM_MODEL = "anthropic/claude-3.5-sonnet"
+LLM_MODEL = "openai/gpt-4o-mini"
 LLM_TEMPERATURE = 0.3
 LLM_MAX_TOKENS = 500
 
 # RAG Configuration
-RAG_LLM_MODEL = "anthropic/claude-3.5-sonnet"
+RAG_LLM_MODEL = "openai/gpt-4o-mini"
 RAG_LLM_TEMPERATURE = 0.3
 RAG_MAX_TOKENS = 2000
 CHUNK_SIZE = 2000  # Characters per chunk for processing

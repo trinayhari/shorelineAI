@@ -1,5 +1,5 @@
 """
-Zoning Regulations Finder - Multi-State Support
+Zoning Regulations Finder - Simplified UI
 Streamlit app for finding official zoning regulations using AI
 """
 import streamlit as st
@@ -7,330 +7,294 @@ import os
 from dotenv import load_dotenv
 
 # Import modules
-from config import STATES, DEFAULT_STATE
-from state_fetcher import fetch_municipalities, get_municipality_term
-from regulation_search import search_zoning_regulations
+from config import STATES
+from state_fetcher import fetch_municipalities
+from regulation_search import search_zoning_regulations, download_pdf_to_temp, get_redirect_url
 from llm_selector import select_best_pdf_with_llm
-from rag_search import process_pdf_for_rag, search_rag, check_pdf_in_mongodb, get_chunks_from_mongodb, get_stored_municipalities, delete_municipality_chunks, inspect_stored_chunks
+from rag_search import (
+    process_pdf_for_rag, search_rag, check_pdf_in_mongodb,
+    get_chunks_from_mongodb, delete_municipality_chunks,
+    generate_missing_embeddings
+)
 
 # Load environment variables
 load_dotenv()
 
 
+def initialize_session_state():
+    """Initialize all session state variables."""
+    defaults = {
+        'rag_chunks': None,
+        'rag_pdf_url': None,
+        'selected_state': None,
+        'selected_municipality': None,
+        'municipalities_dict': None,
+        'is_ready': False,
+        'status_message': '',
+        'pdf_title': None,
+        'processing': False,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def get_api_keys():
+    """Get API keys from environment."""
+    return {
+        'firecrawl': os.getenv("FIRECRAWL_API_KEY", ""),
+        'openrouter': os.getenv("OPENROUTER_API_KEY", ""),
+        'reducto': os.getenv("REDUCTO_API_KEY", ""),
+    }
+
+
+def prepare_municipality_data(state: str, municipality: str, api_keys: dict):
+    """
+    Prepare all data needed for RAG search.
+    Returns True if ready, False if failed.
+    """
+    # Check if already cached in MongoDB
+    if check_pdf_in_mongodb(state=state, municipality=municipality):
+        st.session_state.status_message = "Loading cached data..."
+        chunks = get_chunks_from_mongodb(state=state, municipality=municipality)
+
+        # Validate chunks
+        valid_chunks = [c for c in chunks if c.get("content") and len(c.get("content", "")) > 10]
+        if valid_chunks:
+            st.session_state.rag_chunks = chunks
+            st.session_state.is_ready = True
+            st.session_state.status_message = f"Ready ({len(chunks)} chunks loaded from cache)"
+            return True
+        else:
+            # Corrupted cache - clear it
+            delete_municipality_chunks(state, municipality)
+
+    # Need to search and process
+    st.session_state.status_message = "Searching for zoning regulations..."
+
+    # Search for zoning regulations
+    results = search_zoning_regulations(
+        municipality, state, api_keys['firecrawl']
+    )
+
+    if not results or not isinstance(results, dict) or 'data' not in results:
+        st.session_state.status_message = "No zoning regulations found"
+        return False
+
+    # Use LLM to select best PDF
+    st.session_state.status_message = "Selecting best document..."
+    selected_pdf = select_best_pdf_with_llm(
+        municipality, state, results['data'], api_keys['openrouter']
+    )
+
+    if not selected_pdf:
+        st.session_state.status_message = "Could not find a suitable document"
+        return False
+
+    url = selected_pdf.get('url', '')
+    st.session_state.pdf_title = selected_pdf.get('title', 'Zoning Regulations')
+    st.session_state.rag_pdf_url = url
+
+    # Check if Reducto key is available
+    if not api_keys['reducto']:
+        st.session_state.status_message = "Reducto API key required for document processing"
+        return False
+
+    # Download and process PDF
+    st.session_state.status_message = "Downloading document..."
+    temp_file_path = download_pdf_to_temp(url)
+
+    if temp_file_path:
+        st.session_state.status_message = "Processing document (this may take a moment)..."
+        chunks = process_pdf_for_rag(
+            temp_file_path, api_keys['reducto'],
+            storage_url=url,
+            state=state,
+            municipality=municipality
+        )
+    else:
+        # Try redirect URL
+        st.session_state.status_message = "Trying alternate download method..."
+        redirect_url = get_redirect_url(url)
+
+        if redirect_url and redirect_url != url:
+            chunks = process_pdf_for_rag(
+                redirect_url, api_keys['reducto'],
+                storage_url=url,
+                state=state,
+                municipality=municipality
+            )
+        else:
+            st.session_state.status_message = "Could not access document"
+            return False
+
+    if chunks:
+        st.session_state.rag_chunks = chunks
+        st.session_state.is_ready = True
+        st.session_state.status_message = f"Ready ({len(chunks)} chunks)"
+        return True
+
+    st.session_state.status_message = "Failed to process document"
+    return False
+
+
 def main():
-    st.set_page_config(page_title="Zoning Regulations Finder", page_icon="📋")
+    st.set_page_config(
+        page_title="Zoning Regulations Finder",
+        page_icon="🏘️",
+        layout="centered"
+    )
 
+    initialize_session_state()
+    api_keys = get_api_keys()
+
+    # Check for required API keys
+    missing_keys = []
+    if not api_keys['firecrawl']:
+        missing_keys.append("FIRECRAWL_API_KEY")
+    if not api_keys['openrouter']:
+        missing_keys.append("OPENROUTER_API_KEY")
+    if not api_keys['reducto']:
+        missing_keys.append("REDUCTO_API_KEY")
+
+    if missing_keys:
+        st.error(f"Missing API keys in .env file: {', '.join(missing_keys)}")
+        st.info("Create a .env file with your API keys")
+        return
+
+    # Title
     st.title("🏘️ Zoning Regulations Finder")
-    st.write("AI-powered search for official zoning regulations across the United States")
 
-    # Get API keys
-    api_key = os.getenv("FIRECRAWL_API_KEY", "")
-    openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
-    reducto_key = os.getenv("REDUCTO_API_KEY", "")
+    # Debug toggle in sidebar
+    with st.sidebar:
+        if st.session_state.pdf_title:
+            st.markdown("---")
+            st.markdown(f"**Document:** {st.session_state.pdf_title}")
+        if st.session_state.rag_pdf_url:
+            st.markdown(f"[View PDF]({st.session_state.rag_pdf_url})")
 
-    # API key input (if not in env)
-    col1, col2, col3 = st.columns(3)
+        # Clear cache button
+        if st.session_state.selected_state and st.session_state.selected_municipality:
+            st.markdown("---")
+            if st.button("Clear cached data"):
+                deleted = delete_municipality_chunks(
+                    st.session_state.selected_state,
+                    st.session_state.selected_municipality
+                )
+                st.session_state.rag_chunks = None
+                st.session_state.is_ready = False
+                st.session_state.status_message = f"Cleared {deleted} chunks"
+                st.rerun()
+        
+        # Generate missing embeddings button
+        st.markdown("---")
+        if st.button("Generate missing embeddings"):
+            with st.spinner("Generating missing embeddings..."):
+                updated = generate_missing_embeddings(
+                    st.session_state.selected_state,
+                    st.session_state.selected_municipality
+                )
+                st.success(f"Generated embeddings for {updated} chunks")
+
+    # State and Municipality selection
+    col1, col2 = st.columns(2)
+
+    available_states = list(STATES.keys())
 
     with col1:
-        if not api_key:
-            api_key = st.text_input(
-                "Enter your Firecrawl API Key",
-                type="password",
-                help="Get your API key from https://firecrawl.dev or set FIRECRAWL_API_KEY in .env file"
-            )
-        else:
-            st.success("✓ Firecrawl API key loaded from .env")
+        selected_state = st.selectbox(
+            "State",
+            options=[""] + available_states,
+            index=0,
+            key="state_select"
+        )
 
-    with col2:
-        if not openrouter_key:
-            openrouter_key = st.text_input(
-                "Enter your OpenRouter API Key",
-                type="password",
-                help="Get your API key from https://openrouter.ai/keys or set OPENROUTER_API_KEY in .env file"
-            )
-        else:
-            st.success("✓ OpenRouter API key loaded from .env")
+    # Load municipalities when state is selected
+    municipalities_list = []
+    if selected_state:
+        # Check if we need to load municipalities
+        if st.session_state.selected_state != selected_state:
+            st.session_state.selected_state = selected_state
+            st.session_state.municipalities_dict = None
+            st.session_state.selected_municipality = None
+            st.session_state.rag_chunks = None
+            st.session_state.is_ready = False
 
-    with col3:
-        if not reducto_key:
-            reducto_key = st.text_input(
-                "Enter your Reducto API Key",
-                type="password",
-                help="Get your API key from https://reducto.ai or set REDUCTO_API_KEY in .env file"
-            )
-        else:
-            st.success("✓ Reducto API key loaded from .env")
-
-    # Check required API keys
-    if not api_key:
-        st.warning("Please enter your Firecrawl API key or set FIRECRAWL_API_KEY in .env file")
-        st.info("Create a .env file with: FIRECRAWL_API_KEY=your_api_key_here")
-        return
-
-    if not openrouter_key:
-        st.warning("Please enter your OpenRouter API key or set OPENROUTER_API_KEY in .env file")
-        st.info("Get your API key from https://openrouter.ai/keys")
-        return
-
-    # Initialize session state for RAG
-    if 'rag_chunks' not in st.session_state:
-        st.session_state.rag_chunks = None
-    if 'rag_pdf_url' not in st.session_state:
-        st.session_state.rag_pdf_url = None
-    if 'search_results' not in st.session_state:
-        st.session_state.search_results = None
-    if 'selected_pdf' not in st.session_state:
-        st.session_state.selected_pdf = None
-
-    st.divider()
-
-    # State selection
-    available_states = list(STATES.keys())
-    selected_state = st.selectbox(
-        "Select a State",
-        options=available_states,
-        index=available_states.index(DEFAULT_STATE) if DEFAULT_STATE in available_states else 0
-    )
-
-    municipality_term = get_municipality_term(selected_state)
-
-    # Fetch municipalities for selected state
-    with st.spinner(f"Loading {selected_state} {municipality_term}s..."):
-        municipalities_dict = fetch_municipalities(selected_state, api_key)
-
-    if not municipalities_dict:
-        st.error(f"Failed to load {selected_state} {municipality_term}s. Please check your Firecrawl API key and try again.")
-        return
-
-    st.success(f"Loaded {len(municipalities_dict)} {selected_state} {municipality_term}s")
-
-    # Municipality selection
-    selected_municipality = st.selectbox(
-        f"Select a {municipality_term.title()}",
-        options=[""] + sorted(municipalities_dict.keys()),
-        index=0
-    )
-
-    # Debug toggle
-    show_debug = st.checkbox("Show debug information", value=False)
-
-    # Search button
-    if selected_municipality:
-        if st.button("Search for Zoning Regulations", type="primary"):
-            with st.spinner(f"Searching for {selected_municipality} zoning regulations..."):
-                results = search_zoning_regulations(
-                    selected_municipality,
-                    selected_state,
-                    api_key,
-                    show_debug=show_debug
+        if st.session_state.municipalities_dict is None:
+            with st.spinner("Loading municipalities..."):
+                st.session_state.municipalities_dict = fetch_municipalities(
+                    selected_state, api_keys['firecrawl']
                 )
 
-                # Store results in session state
-                st.session_state.search_results = results
+        if st.session_state.municipalities_dict:
+            municipalities_list = sorted(st.session_state.municipalities_dict.keys())
 
-                # Get AI selection and store it
-                if results and isinstance(results, dict) and 'data' in results:
-                    selected_pdf = select_best_pdf_with_llm(
-                        selected_municipality,
-                        selected_state,
-                        results['data'],
-                        openrouter_key
-                    )
-                    st.session_state.selected_pdf = selected_pdf
+    with col2:
+        selected_municipality = st.selectbox(
+            "Municipality",
+            options=[""] + municipalities_list,
+            index=0,
+            disabled=not selected_state,
+            key="municipality_select"
+        )
 
-        # Display results from session state
-        results = st.session_state.search_results
+    # Detect municipality change and trigger processing
+    if selected_municipality and selected_municipality != st.session_state.selected_municipality:
+        st.session_state.selected_municipality = selected_municipality
+        st.session_state.rag_chunks = None
+        st.session_state.is_ready = False
+        st.session_state.processing = True
+        st.rerun()
 
-        if results and isinstance(results, dict) and 'data' in results:
-            if show_debug:
-                # Show debug info
-                with st.expander("🔍 Debug Info", expanded=True):
-                    # Show the main page that was scraped
-                    main_page = results['data'][0] if results['data'] else None
-                    if main_page and not main_page.get('is_pdf', False):
-                        st.write(f"**Top search result (scraped):** {main_page['url']}")
+    # Process if needed
+    if st.session_state.processing and selected_state and selected_municipality:
+        with st.status("Preparing data...", expanded=True) as status:
+            success = prepare_municipality_data(
+                selected_state,
+                selected_municipality,
+                api_keys
+            )
+            st.session_state.processing = False
+            if success:
+                status.update(label="Ready!", state="complete")
+            else:
+                status.update(label="Failed", state="error")
+        st.rerun()
 
-                    # Show all links found
-                    all_links = results['data'][1:] if len(results['data']) > 1 else []
-                    if all_links:
-                        st.write(f"**Found {len(all_links)} links on that page:**")
-                        for idx, link in enumerate(all_links[:20], 1):  # Show first 20
-                            link_text = link.get('link_text', 'No text')
-                            url = link.get('url', '')
-                            is_pdf = "📄 PDF" if link.get('is_pdf', False) else "🔗 Link"
-                            score = link.get('relevance', 0)
-                            st.text(f"{idx}. {is_pdf} [{score}pts] {link_text[:80]}")
-                            st.text(f"   → {url[:100]}")
-                        if len(all_links) > 20:
-                            st.text(f"... and {len(all_links) - 20} more")
-
-            # Show statistics
-            pdf_count = sum(1 for r in results['data'] if r.get('is_pdf', False))
-            st.info(f"Found {len(results['data'])} result(s) • {pdf_count} PDF(s) detected")
-
-            # Get selected PDF from session state
-            selected_pdf = st.session_state.selected_pdf
-
-            # Show what was selected
-            if selected_pdf and show_debug:
-                with st.expander("🔍 Debug Info", expanded=True):
-                    st.write("**🤖 AI Selected:**")
-                    st.write(f"Link text: {selected_pdf.get('link_text', 'N/A')}")
-                    st.write(f"URL: {selected_pdf.get('url', 'N/A')}")
-                    st.write(f"Relevance score: {selected_pdf.get('relevance', 0)}")
-
-            if selected_pdf:
-                # Safety check
-                if not selected_pdf.get('is_pdf', False):
-                    st.warning("⚠️ Selected result may not be a PDF file")
-
-                st.markdown("### 📄 Recommended Zoning Regulations")
-
-                title = selected_pdf.get('title', 'Untitled')
-                url = selected_pdf.get('url', '')
-
-                # Display prominently
-                st.markdown(f"**[{title}]({url})**")
-
-                # RAG Search Feature
-                st.markdown("---")
-                st.markdown("### 🔍 Search This Document (RAG)")
-
-                if not reducto_key:
-                    st.info("💡 Enter your Reducto API key above to enable document search")
-                else:
-                    # Check if chunks are already in session state for this municipality
-                    pdf_in_session = (
-                        st.session_state.rag_chunks is not None and
-                        st.session_state.rag_pdf_url == url
-                    )
-
-                    if pdf_in_session:
-                        st.success(f"✓ Document ready ({len(st.session_state.rag_chunks)} chunks)")
-                        # Debug: Show what's stored
-                        if show_debug:
-                            with st.expander("🔍 Inspect stored chunks"):
-                                info = inspect_stored_chunks(selected_state, selected_municipality)
-                                total = info.get('count', 0)
-                                with_emb = info.get('with_embeddings', 0)
-                                st.write(f"**Total chunks:** {total}")
-                                st.write(f"**With embeddings:** {with_emb} ({100*with_emb//max(total,1)}%)")
-                                for sample in info.get('samples', []):
-                                    emb_status = "✓" if sample.get('has_embedding') else "✗"
-                                    st.write(f"**Chunk {sample['chunk_index']}:** {sample['content_length']} chars | Embedding: {emb_status}")
-                                    st.code(sample['content_preview'])
-                    else:
-                        # Check if this municipality was already processed (by state + municipality)
-                        pdf_in_mongodb = check_pdf_in_mongodb(state=selected_state, municipality=selected_municipality)
-
-                        if pdf_in_mongodb:
-                            # Auto-load from MongoDB instead of re-processing
-                            with st.spinner(f"Loading {selected_municipality} data from database..."):
-                                chunks = get_chunks_from_mongodb(state=selected_state, municipality=selected_municipality)
-
-                                # Check if chunks have valid content
-                                valid_chunks = [c for c in chunks if c.get("content") and len(c.get("content", "")) > 10]
-
-                                if valid_chunks:
-                                    st.session_state.rag_chunks = chunks
-                                    st.session_state.rag_pdf_url = url
-                                    st.success(f"✓ Loaded {len(chunks)} chunks for {selected_municipality}, {selected_state} (cached)")
-                                    st.rerun()
-                                else:
-                                    # Data exists but is empty/corrupted - offer to re-process
-                                    st.warning(f"Cached data for {selected_municipality} appears empty or corrupted.")
-                                    if st.button("🔄 Clear cache and re-process", type="secondary"):
-                                        deleted = delete_municipality_chunks(selected_state, selected_municipality)
-                                        st.info(f"Cleared {deleted} old chunks. Click 'Process PDF' to re-process.")
-                                        st.rerun()
-                        else:
-                            # Need to process with Reducto
-                            if st.button("📥 Process PDF for Search", type="secondary"):
-                                # Download the PDF first (handles redirects)
-                                from regulation_search import download_pdf_to_temp, get_redirect_url
-
-                                temp_file_path = None
-
-                                # Try regular download first
-                                with st.spinner("Downloading PDF..."):
-                                    temp_file_path = download_pdf_to_temp(url)
-
-                                if temp_file_path:
-                                    # Use the downloaded file, store with state/municipality
-                                    st.success("✓ PDF downloaded successfully")
-                                    chunks = process_pdf_for_rag(
-                                        temp_file_path, reducto_key,
-                                        storage_url=url,
-                                        state=selected_state,
-                                        municipality=selected_municipality,
-                                        debug=show_debug
-                                    )
-                                    if chunks:
-                                        st.session_state.rag_chunks = chunks
-                                        st.session_state.rag_pdf_url = url
-                                        st.rerun()
-                                else:
-                                    # If download fails, try to get redirect URL and use Reducto directly
-                                    st.info("Trying to get redirect URL for Reducto...")
-                                    redirect_url = get_redirect_url(url)
-
-                                    if redirect_url and redirect_url != url:
-                                        st.info(f"Found redirect URL: {redirect_url}")
-                                        # Try Reducto with redirect URL, store with state/municipality
-                                        chunks = process_pdf_for_rag(
-                                            redirect_url, reducto_key,
-                                            storage_url=url,
-                                            state=selected_state,
-                                            municipality=selected_municipality,
-                                            debug=show_debug
-                                        )
-                                        if chunks:
-                                            st.session_state.rag_chunks = chunks
-                                            st.session_state.rag_pdf_url = url
-                                            st.rerun()
-                                    else:
-                                        st.error("⚠️ Could not access PDF. The server is blocking automated requests.")
-
-                    # Show search interface if document is processed
-                    if st.session_state.rag_chunks and st.session_state.rag_pdf_url == url:
-                        question = st.text_input(
-                            "Ask a question about this document:",
-                            placeholder="e.g., What are the setback requirements for residential zones?"
-                        )
-
-                        if question:
-                            with st.spinner("Searching document..."):
-                                answer = search_rag(
-                                    question,
-                                    st.session_state.rag_chunks,
-                                    openrouter_key,
-                                    debug=show_debug
-                                )
-
-                                if answer:
-                                    st.markdown("**Answer:**")
-                                    st.markdown(answer)
-
-                st.divider()
-
-            # Show all results in expandable section
-            with st.expander("📋 View All Results", expanded=False):
-                for idx, result in enumerate(results['data'], 1):
-                    title = result.get('title', 'Untitled')
-                    url = result.get('url', '')
-                    is_pdf = result.get('is_pdf', False)
-
-                    # Add indicator
-                    indicator = "📄" if is_pdf else "🔗"
-
-                    # Highlight selected
-                    if selected_pdf and url == selected_pdf.get('url'):
-                        st.markdown(f"{idx}. {indicator} **[{title}]({url})** ⭐")
-                    else:
-                        st.markdown(f"{idx}. {indicator} [{title}]({url})")
+    # Status indicator
+    if st.session_state.status_message:
+        if st.session_state.is_ready:
+            st.success(st.session_state.status_message)
+        elif "Failed" in st.session_state.status_message or "Could not" in st.session_state.status_message:
+            st.error(st.session_state.status_message)
         else:
-            if st.session_state.search_results is not None:
-                st.warning("No results found")
+            st.info(st.session_state.status_message)
+
+    st.markdown("---")
+
+    # Question input - always visible, but disabled until ready
+    is_ready = st.session_state.is_ready and st.session_state.rag_chunks is not None
+
+    question = st.text_input(
+        "Ask a question about zoning regulations:",
+        placeholder="e.g., What are the setback requirements for residential zones?" if is_ready else "Select a state and municipality first...",
+        disabled=not is_ready,
+        key="question_input"
+    )
+
+    # Process question
+    if question and is_ready:
+        with st.spinner("Searching document..."):
+            answer = search_rag(
+                question,
+                api_keys['openrouter'],
+                state=st.session_state.selected_state,
+                municipality=st.session_state.selected_municipality
+            )
+
+        if answer:
+            st.markdown("### Answer")
+            st.markdown(answer)
 
 
 if __name__ == "__main__":
