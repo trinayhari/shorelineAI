@@ -1,13 +1,14 @@
 "use client";
 
 import { useState } from "react";
-import { ModeSelector } from "@/components/ModeSelector";
+import { ModeSelector, type SearchMode } from "@/components/ModeSelector";
 import { ZoningSearch } from "@/components/ZoningSearch";
 import { PropertySearch } from "@/components/PropertySearch";
+import { PropertyResearch } from "@/components/PropertyResearch";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
 export default function Home() {
-  const [mode, setMode] = useState<"zoning" | "parcels">("zoning");
+  const [mode, setMode] = useState<SearchMode>("zoning");
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -26,7 +27,9 @@ export default function Home() {
 
         <Card>
           <CardContent className="pt-6">
-            {mode === "zoning" ? <ZoningSearch /> : <PropertySearch />}
+            {mode === "zoning" && <ZoningSearch />}
+            {mode === "parcels" && <PropertySearch />}
+            {mode === "research" && <PropertyResearch />}
           </CardContent>
         </Card>
       </main>
