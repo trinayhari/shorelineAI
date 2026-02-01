@@ -14,46 +14,60 @@ export interface ParcelOwnership {
 }
 
 export interface ParcelZoning {
-  stateUseDescription?: string;
-  zoneDescription?: string;
+  state_use_description?: string;
+  zone_description?: string;
+  zone?: string;
 }
 
 export interface ParcelLand {
   acres?: number;
-  waterFrontageFt?: number;
+  water_frontage_ft?: number;
+  frontage_ft?: number;
+  depth_ft?: number;
 }
 
 export interface ParcelRooms {
   bedrooms?: number;
   bathrooms?: number;
+  total_rooms?: number;
 }
 
 export interface ParcelArea {
   living?: number;
+  total?: number;
 }
 
 export interface ParcelBuilding {
-  styleDesc?: string;
+  style_desc?: string;
   rooms?: ParcelRooms;
   area?: ParcelArea;
-  actualYearBuilt?: number;
+  actual_year_built?: number;
+  condition?: string;
+  grade?: string;
+  stories?: number;
 }
 
 export interface ParcelValuation {
-  valuationYear: number;
+  valuation_year: number;
   assessed?: {
+    total?: number;
+    land?: number;
+    building?: number;
+  };
+  appraised?: {
     total?: number;
   };
 }
 
 export interface ParcelSale {
-  salePrice?: number;
-  saleDate?: string;
+  sale_price?: number;
+  sale_date?: string;
+  deed_type?: string;
 }
 
 export interface Parcel {
   _id?: string;
-  parcelId?: string;
+  parcel_id?: string;
   town?: ParcelTown;
   location?: ParcelLocation;
   ownership?: ParcelOwnership;
@@ -64,7 +78,7 @@ export interface Parcel {
   sales?: ParcelSale[];
   embedding?: number[];
   rag?: {
-    searchableText?: string;
+    searchable_text?: string;
     embedding?: number[];
   };
   score?: number;

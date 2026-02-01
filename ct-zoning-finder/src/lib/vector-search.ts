@@ -157,89 +157,94 @@ export function formatParcelContext(parcels: Parcel[]): string {
 
   for (let i = 0; i < parcels.length; i++) {
     const p = parcels[i];
-    const parts: string[] = [`**Parcel ${i + 1}:**`];
-
-    // Location
     const loc = p.location || {};
     const town = p.town || {};
-    if (loc.address) {
-      parts.push(
-        `- Address: ${loc.address}, ${loc.city || ""}, ${loc.state || "CT"} ${loc.zip || ""}`
-      );
-    }
-    if (town.name) {
-      parts.push(`- Town: ${town.name}`);
-    }
+    const zoning = p.zoning || {};
+    const land = p.land || {};
+    const buildings = p.buildings || [];
+    const valuations = p.valuations || [];
+    const sales = p.sales || [];
+
+    // Build address line
+    const addressParts: string[] = [];
+    if (loc.address) addressParts.push(loc.address);
+    if (loc.city) addressParts.push(loc.city);
+    if (loc.state || loc.zip) addressParts.push(`${loc.state || "CT"} ${loc.zip || ""}`.trim());
+    const fullAddress = addressParts.join(", ") || "Address not available";
+
+    // Start with header
+    const parts: string[] = [];
+    parts.push(`### Property ${i + 1}: ${fullAddress}`);
+    if (town.name) parts.push(`**Town:** ${town.name}`);
 
     // Owner
-    const owner = p.ownership?.owner;
-    if (owner) {
-      parts.push(`- Owner: ${owner}`);
+    if (p.ownership?.owner) {
+      parts.push(`**Owner:** ${p.ownership.owner}`);
     }
 
-    // Zoning
-    const zoning = p.zoning || {};
-    if (zoning.stateUseDescription) {
-      parts.push(`- Property Type: ${zoning.stateUseDescription}`);
+    // Property details section
+    const details: string[] = [];
+
+    // Zoning info
+    if (zoning.state_use_description) {
+      details.push(`**Type:** ${zoning.state_use_description}`);
     }
-    if (zoning.zoneDescription) {
-      parts.push(`- Zoning: ${zoning.zoneDescription}`);
+    if (zoning.zone_description || zoning.zone) {
+      details.push(`**Zone:** ${zoning.zone_description || zoning.zone}`);
     }
 
-    // Land
-    const land = p.land || {};
+    // Land info
     if (land.acres) {
-      parts.push(`- Land: ${land.acres} acres`);
+      details.push(`**Land:** ${land.acres} acres`);
     }
-    if (land.waterFrontageFt) {
-      parts.push(`- Water Frontage: ${land.waterFrontageFt} ft`);
+    if (land.water_frontage_ft) {
+      details.push(`**Waterfront:** ${land.water_frontage_ft} ft`);
     }
 
-    // Building
-    const buildings = p.buildings || [];
+    if (details.length > 0) {
+      parts.push(details.join(" | "));
+    }
+
+    // Building info
     if (buildings.length > 0) {
       const bldg = buildings[0];
-      const bldgInfo: string[] = [];
-      if (bldg.styleDesc) bldgInfo.push(bldg.styleDesc);
-      if (bldg.rooms?.bedrooms) bldgInfo.push(`${bldg.rooms.bedrooms} bed`);
-      if (bldg.rooms?.bathrooms) bldgInfo.push(`${bldg.rooms.bathrooms} bath`);
-      if (bldg.area?.living) bldgInfo.push(`${Math.floor(bldg.area.living)} sq ft`);
-      if (bldg.actualYearBuilt) bldgInfo.push(`built ${bldg.actualYearBuilt}`);
-      if (bldgInfo.length > 0) {
-        parts.push(`- Building: ${bldgInfo.join(", ")}`);
+      const bldgParts: string[] = [];
+
+      if (bldg.style_desc) bldgParts.push(bldg.style_desc);
+      if (bldg.rooms?.bedrooms) bldgParts.push(`${bldg.rooms.bedrooms} BR`);
+      if (bldg.rooms?.bathrooms) bldgParts.push(`${bldg.rooms.bathrooms} BA`);
+      if (bldg.area?.living) bldgParts.push(`${Math.floor(bldg.area.living).toLocaleString()} sq ft`);
+      if (bldg.actual_year_built) bldgParts.push(`Built ${bldg.actual_year_built}`);
+      if (bldg.stories) bldgParts.push(`${bldg.stories} stories`);
+
+      if (bldgParts.length > 0) {
+        parts.push(`**Building:** ${bldgParts.join(" • ")}`);
       }
     }
 
     // Valuation
-    const valuations = p.valuations || [];
     if (valuations.length > 0) {
       const latest = valuations.reduce((a, b) =>
-        (a.valuationYear || 0) > (b.valuationYear || 0) ? a : b
+        (a.valuation_year || 0) > (b.valuation_year || 0) ? a : b
       );
-      const assessed = latest.assessed?.total;
-      if (assessed) {
-        parts.push(`- Assessed Value: $${assessed.toLocaleString()}`);
+      if (latest.assessed?.total) {
+        const valueParts: string[] = [`**Assessed:** $${latest.assessed.total.toLocaleString()}`];
+        if (latest.assessed.land) valueParts.push(`Land: $${latest.assessed.land.toLocaleString()}`);
+        if (latest.assessed.building) valueParts.push(`Building: $${latest.assessed.building.toLocaleString()}`);
+        parts.push(valueParts.join(" | "));
       }
     }
 
     // Sales
-    const sales = p.sales || [];
-    if (sales.length > 0 && sales[0].salePrice !== undefined) {
+    if (sales.length > 0 && sales[0].sale_price !== undefined) {
       const sale = sales[0];
-      parts.push(
-        `- Last Sale: $${sale.salePrice!.toLocaleString()} (${sale.saleDate || "N/A"})`
-      );
-    }
-
-    // Score
-    if (p.score !== undefined) {
-      parts.push(`- Relevance Score: ${p.score.toFixed(3)}`);
+      parts.push(`**Last Sale:** $${sale.sale_price!.toLocaleString()} (${sale.sale_date || "N/A"})`);
     }
 
     contextParts.push(parts.join("\n"));
   }
 
-  return contextParts.join("\n\n");
+  return contextParts.join("\n\n---\n\n");
 }
 
 export async function storeChunksToMongoDB(

@@ -41,7 +41,7 @@ export async function getChunksCollection() {
 
 export async function getParcelsCollection() {
   const db = await getDatabase();
-  return db.collection("parcels");
+  return db.collection("cama_properties");
 }
 
 export async function getJobsCollection() {
