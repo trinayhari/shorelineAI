@@ -45,6 +45,10 @@ def get_chunks_collection():
     client = get_mongo_client()
     return client[MONGODB_DB_NAME].chunks
 
+def get_parcels_collection():
+    client = get_mongo_client()
+    return client[MONGODB_DB_NAME].parcels
+
 # -----------------------
 # Embedding Functions
 # -----------------------
@@ -222,6 +226,320 @@ def _mongodb_vector_search(query_embedding: list, state: str = None, municipalit
         
     except Exception:
         return ""
+
+def get_available_towns() -> list:
+    """Get list of available towns from parcel data (cached)."""
+    try:
+        collection = get_parcels_collection()
+        
+        # Use a simple distinct query - much faster than aggregation
+        towns = list(collection.distinct("town.name"))
+        # Filter out None/empty values and sort
+        towns = [town for town in towns if town and town.strip()]
+        return sorted(towns)
+    except Exception as e:
+        st.error(f"Failed to fetch towns: {e}")
+        return []
+
+def get_town_parcel_counts() -> dict:
+    """Get parcel counts for each town (cached and optimized)."""
+    try:
+        collection = get_parcels_collection()
+        
+        # Use a more efficient aggregation with index hints
+        pipeline = [
+            {"$match": {"town.name": {"$exists": True, "$ne": None}}},
+            {"$group": {
+                "_id": "$town.name",
+                "count": {"$sum": 1}
+            }},
+            {"$sort": {"count": -1}},
+            {"$limit": 50}  # Limit to top 50 towns for performance
+        ]
+        
+        results = list(collection.aggregate(pipeline, allowDiskUse=False))
+        return {str(r["_id"]): r["count"] for r in results if r["_id"]}
+    except Exception as e:
+        st.error(f"Failed to get town counts: {e}")
+        return {}
+
+def check_parcel_vector_setup() -> dict:
+    """Check if parcel data is set up for vector search."""
+    try:
+        collection = get_parcels_collection()
+        
+        # Check total parcels
+        total_parcels = collection.count_documents({})
+        
+        # Check parcels with embeddings
+        parcels_with_embeddings = collection.count_documents({
+            "embedding": {"$exists": True, "$ne": None}
+        })
+        
+        # Check parcels with searchable text
+        parcels_with_text = collection.count_documents({
+            "rag.searchable_text": {"$exists": True, "$ne": None}
+        })
+        
+        # Test vector search
+        vector_search_works = False
+        if parcels_with_embeddings > 0:
+            try:
+                # Create a dummy embedding for testing
+                test_embedding = [0.0] * 1536  # OpenAI embedding dimension
+                test_pipeline = [{
+                    "$vectorSearch": {
+                        "index": "vector_index",
+                        "path": "rag.embedding",
+                        "queryVector": test_embedding,
+                        "numCandidates": 1,
+                        "limit": 1
+                    }
+                }]
+                list(collection.aggregate(test_pipeline))
+                vector_search_works = True
+            except Exception:
+                vector_search_works = False
+        
+        return {
+            "total_parcels": total_parcels,
+            "parcels_with_embeddings": parcels_with_embeddings,
+            "parcels_with_text": parcels_with_text,
+            "vector_search_works": vector_search_works,
+            "embedding_coverage": parcels_with_embeddings / total_parcels if total_parcels > 0 else 0
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+def get_available_towns() -> list:
+    """Get list of available towns from parcel data."""
+    try:
+        collection = get_parcels_collection()
+        towns = list(collection.distinct("town.name"))
+        # Filter out None/empty values and sort
+        towns = [town for town in towns if town and town.strip()]
+        return sorted(towns)
+    except Exception as e:
+        st.error(f"Failed to fetch towns: {e}")
+        return []
+
+# -----------------------
+# Parcel Data Search
+# -----------------------
+def search_parcel_data(query: str, openrouter_api_key: str = None, town: str = None, limit: int = 5) -> str:
+    """Search parcel data using MongoDB vector search."""
+    api_key = openrouter_api_key or OPENROUTER_API_KEY
+    if not api_key:
+        return "Error: OpenRouter API key not provided."
+
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+        default_headers={"HTTP-Referer": "http://localhost:8501", "X-Title": "Parcel RAG Chat"},
+    )
+
+    # Generate query embedding
+    query_embedding = get_embedding(query, api_key)
+    if not query_embedding:
+        return "Failed to generate query embedding."
+
+    # MongoDB vector search for parcels
+    parcels = _mongodb_parcel_search(query_embedding, town, limit)
+    if not parcels:
+        # Try a simple test to see if vector search works at all
+        test_parcels = _mongodb_parcel_search(query_embedding, None, 3)
+        if not test_parcels:
+            return "Vector search is not finding any parcels. Check if the vector index is properly configured in MongoDB Atlas."
+        else:
+            return f"No parcels found in {town}. Try searching without town filter or check if the town name is correct."
+
+    # Format parcel context
+    context = _format_parcel_context(parcels)
+
+    # Generate response
+    system_prompt = """You are a helpful assistant specializing in Connecticut real estate and property data.
+You have access to detailed parcel records including property addresses, owners, valuations, building details, and sales history.
+
+When answering questions:
+- Be specific and cite the data provided
+- If multiple properties match, summarize the key findings
+- If no properties match, suggest refining the search
+- Format currency values with commas
+- Be concise but informative"""
+
+    user_prompt = f"""Based on the following Connecticut parcel records, answer this question:
+
+Question: {query}
+
+Parcel Data:
+{context}
+
+Provide a helpful, accurate response based on the data above."""
+
+    try:
+        response = client.chat.completions.create(
+            model="openai/gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1000
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Parcel Search Error: {e}"
+
+def _mongodb_parcel_search(query_embedding: list, town: str = None, limit: int = 5) -> list:
+    """Perform MongoDB vector search for parcels."""
+    try:
+        collection = get_parcels_collection()
+        
+        # Debug: Check what towns actually exist in the data
+        if town:
+            # Check exact town name matches
+            exact_match = collection.count_documents({"town.name": town})
+            st.write(f"🔍 Debug: Looking for town: '{town}'")
+            st.write(f"📊 Debug: Exact matches found: {exact_match:,}")
+            
+            # Check for similar town names
+            similar_towns = list(collection.aggregate([
+                {"$match": {"town.name": {"$regex": town, "$options": "i"}}},
+                {"$group": {"_id": "$town.name", "count": {"$sum": 1}}},
+                {"$limit": 10}
+            ]))
+            if similar_towns:
+                st.write("🔍 Debug: Similar town names in database:")
+                for item in similar_towns:
+                    st.write(f"   - '{item['_id']}' ({item['count']:,} parcels)")
+        
+        # Build pipeline - vectorSearch must be FIRST stage
+        pipeline = [{
+            "$vectorSearch": {
+                "index": "scalar_vector_index",
+                "path": "embedding",
+                "queryVector": query_embedding,
+                "numCandidates": limit * 10,
+                "limit": limit
+            }
+        }]
+
+        # Add town filter inside vectorSearch (not as separate stage)
+        if town and exact_match > 0:  # Only add filter if town exists in data
+            pipeline[0]["$vectorSearch"]["filter"] = {"town.name": town}
+        elif town:
+            st.warning(f"⚠️ Town '{town}' found in database but filtering may not work until vector index is updated with town filter field.")
+
+        # Project results
+        pipeline.append({
+            "$project": {
+                "score": {"$meta": "vectorSearchScore"},
+                "parcel_id": 1,
+                "town.name": 1,
+                "location": 1,
+                "ownership.owner": 1,
+                "zoning": 1,
+                "land": 1,
+                "buildings": 1,
+                "valuations": 1,
+                "sales": 1,
+                "rag.searchable_text": 1
+            }
+        })
+
+        results = list(collection.aggregate(pipeline))
+        
+        # Debug: Show what towns were actually found in results
+        if results and town:
+            found_towns = set()
+            for result in results:
+                found_towns.add(result.get('town', {}).get('name', 'Unknown'))
+            st.write(f"🔍 Debug: Results from towns: {list(found_towns)}")
+        
+        return results
+        
+    except Exception as e:
+        st.error(f"Parcel vector search error: {e}")
+        return []
+
+def _format_parcel_context(parcels: list) -> str:
+    """Format parcel data as context for the LLM."""
+    if not parcels:
+        return "No matching parcels found."
+
+    context_parts = []
+    for i, p in enumerate(parcels, 1):
+        parts = [f"**Parcel {i}:**"]
+
+        # Location
+        loc = p.get('location', {})
+        town = p.get('town', {})
+        if loc.get('address'):
+            parts.append(f"- Address: {loc['address']}, {loc.get('city', '')}, {loc.get('state', 'CT')} {loc.get('zip', '')}")
+        if town.get('name'):
+            parts.append(f"- Town: {town['name']}")
+
+        # Owner
+        owner = p.get('ownership', {}).get('owner')
+        if owner:
+            parts.append(f"- Owner: {owner}")
+
+        # Zoning
+        zoning = p.get('zoning', {})
+        if zoning.get('state_use_description'):
+            parts.append(f"- Property Type: {zoning['state_use_description']}")
+        if zoning.get('zone_description'):
+            parts.append(f"- Zoning: {zoning['zone_description']}")
+
+        # Land
+        land = p.get('land', {})
+        if land.get('acres'):
+            parts.append(f"- Land: {land['acres']} acres")
+        if land.get('water_frontage_ft'):
+            parts.append(f"- Water Frontage: {land['water_frontage_ft']} ft")
+
+        # Building
+        buildings = p.get('buildings', [])
+        if buildings:
+            bldg = buildings[0]
+            bldg_info = []
+            if bldg.get('style_desc'):
+                bldg_info.append(bldg['style_desc'])
+            rooms = bldg.get('rooms', {})
+            if rooms.get('bedrooms'):
+                bldg_info.append(f"{rooms['bedrooms']} bed")
+            if rooms.get('bathrooms'):
+                bldg_info.append(f"{rooms['bathrooms']} bath")
+            area = bldg.get('area', {})
+            if area.get('living'):
+                bldg_info.append(f"{int(area['living'])} sq ft")
+            if bldg.get('actual_year_built'):
+                bldg_info.append(f"built {bldg['actual_year_built']}")
+            if bldg_info:
+                parts.append(f"- Building: {', '.join(bldg_info)}")
+
+        # Valuation
+        valuations = p.get('valuations', [])
+        if valuations:
+            latest = max(valuations, key=lambda v: v.get('valuation_year', 0))
+            assessed = latest.get('assessed', {}).get('total')
+            if assessed:
+                parts.append(f"- Assessed Value: ${assessed:,.0f}")
+
+        # Sales
+        sales = p.get('sales', [])
+        if sales and sales[0].get('sale_price'):
+            sale = sales[0]
+            parts.append(f"- Last Sale: ${sale['sale_price']:,.0f} ({sale.get('sale_date', 'N/A')})")
+
+        # Score if available
+        if 'score' in p:
+            parts.append(f"- Relevance Score: {p['score']:.3f}")
+
+        context_parts.append('\n'.join(parts))
+
+    return '\n\n'.join(context_parts)
 
 # -----------------------
 # Storage Functions

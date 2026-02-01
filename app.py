@@ -14,7 +14,7 @@ from llm_selector import select_best_pdf_with_llm
 from rag_search import (
     process_pdf_for_rag, search_rag, check_pdf_in_mongodb,
     get_chunks_from_mongodb, delete_municipality_chunks,
-    generate_missing_embeddings
+    generate_missing_embeddings, search_parcel_data, get_available_towns
 )
 
 # Load environment variables
@@ -31,8 +31,9 @@ def initialize_session_state():
         'municipalities_dict': None,
         'is_ready': False,
         'status_message': '',
-        'pdf_title': None,
         'processing': False,
+        'pdf_title': None,
+        'available_towns': None  # Cache for towns only
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -163,7 +164,59 @@ def main():
         return
 
     # Title
-    st.title("🏘️ Zoning Regulations Finder")
+    st.title("🏘️ Zoning Regulations & Property Finder")
+
+    # Search mode selector
+    st.markdown("### Search Mode")
+    search_mode = st.radio(
+        "Choose what to search:",
+        ["Zoning Regulations", "Property/Parcel Data"],
+        horizontal=True
+    )
+
+    if search_mode == "Property/Parcel Data":
+        # Parcel Search UI
+        st.markdown("### Property Search")
+        st.markdown("Search Connecticut property and parcel data using vector search")
+        
+        # Load town data with caching (no counts for speed)
+        if st.session_state.available_towns is None:
+            with st.spinner("Loading towns..."):
+                st.session_state.available_towns = get_available_towns()
+        
+        available_towns = st.session_state.available_towns
+        
+        # Town selector
+        st.markdown("#### Select Town")
+        
+        # Simple dropdown without counts (much faster)
+        parcel_town = st.selectbox(
+            "Choose a town to search:",
+            options=available_towns,
+            help="Vector search will find properties in this town"
+        )
+        
+        selected_town = parcel_town
+        
+        question = st.text_area(
+            "Ask about properties:",
+            placeholder="e.g., Find waterfront properties, Show 4 bedroom colonials, What are commercial properties?",
+            key="parcel_question"
+        )
+        
+        if question and st.button("🔍 Search Properties"):
+            with st.spinner("Searching property data..."):
+                answer = search_parcel_data(
+                    question,
+                    api_keys['openrouter'],
+                    town=selected_town
+                )
+            
+            if answer:
+                st.markdown("### Property Search Results")
+                st.markdown(answer)
+        
+        return  # Exit early for parcel search mode
 
     # Debug toggle in sidebar
     with st.sidebar:
@@ -196,70 +249,84 @@ def main():
                 )
                 st.success(f"Generated embeddings for {updated} chunks")
 
-    # State and Municipality selection
-    col1, col2 = st.columns(2)
+    # State and Municipality selection (only for Zoning Regulations)
+    if search_mode == "Zoning Regulations":
+        st.markdown("### Select Location for Zoning Regulations")
+        
+        col1, col2 = st.columns(2)
 
-    available_states = list(STATES.keys())
+        available_states = list(STATES.keys())
 
-    with col1:
-        selected_state = st.selectbox(
-            "State",
-            options=[""] + available_states,
-            index=0,
-            key="state_select"
-        )
+        with col1:
+            selected_state = st.selectbox(
+                "State",
+                options=[""] + available_states,
+                index=0,
+                key="state_select",
+                help="Select a state to load zoning regulations"
+            )
 
-    # Load municipalities when state is selected
-    municipalities_list = []
-    if selected_state:
-        # Check if we need to load municipalities
-        if st.session_state.selected_state != selected_state:
-            st.session_state.selected_state = selected_state
-            st.session_state.municipalities_dict = None
-            st.session_state.selected_municipality = None
+        # Load municipalities when state is selected
+        municipalities_list = []
+        if selected_state:
+            # Check if we need to load municipalities
+            if st.session_state.selected_state != selected_state:
+                st.session_state.selected_state = selected_state
+                st.session_state.municipalities_dict = None
+                st.session_state.selected_municipality = None
+                st.session_state.rag_chunks = None
+                st.session_state.is_ready = False
+
+            if st.session_state.municipalities_dict is None:
+                with st.spinner("Loading municipalities..."):
+                    st.session_state.municipalities_dict = fetch_municipalities(
+                        selected_state, api_keys['firecrawl']
+                    )
+
+            if st.session_state.municipalities_dict:
+                municipalities_list = sorted(st.session_state.municipalities_dict.keys())
+
+        with col2:
+            if selected_state:
+                selected_municipality = st.selectbox(
+                    "Municipality",
+                    options=[""] + municipalities_list,
+                    index=0,
+                    key="municipality_select",
+                    help="Select a municipality to search its zoning regulations"
+                )
+            else:
+                st.selectbox(
+                    "Municipality",
+                    options=[""],
+                    index=0,
+                    disabled=True,
+                    help="Please select a state first"
+                )
+                selected_municipality = ""
+
+        # Detect municipality change and trigger processing
+        if selected_municipality and selected_municipality != st.session_state.selected_municipality:
+            st.session_state.selected_municipality = selected_municipality
             st.session_state.rag_chunks = None
             st.session_state.is_ready = False
+            st.session_state.processing = True
+            st.rerun()
 
-        if st.session_state.municipalities_dict is None:
-            with st.spinner("Loading municipalities..."):
-                st.session_state.municipalities_dict = fetch_municipalities(
-                    selected_state, api_keys['firecrawl']
+        # Process if needed
+        if st.session_state.processing and selected_state and selected_municipality:
+            with st.status("Preparing data...", expanded=True) as status:
+                success = prepare_municipality_data(
+                    selected_state,
+                    selected_municipality,
+                    api_keys
                 )
-
-        if st.session_state.municipalities_dict:
-            municipalities_list = sorted(st.session_state.municipalities_dict.keys())
-
-    with col2:
-        selected_municipality = st.selectbox(
-            "Municipality",
-            options=[""] + municipalities_list,
-            index=0,
-            disabled=not selected_state,
-            key="municipality_select"
-        )
-
-    # Detect municipality change and trigger processing
-    if selected_municipality and selected_municipality != st.session_state.selected_municipality:
-        st.session_state.selected_municipality = selected_municipality
-        st.session_state.rag_chunks = None
-        st.session_state.is_ready = False
-        st.session_state.processing = True
-        st.rerun()
-
-    # Process if needed
-    if st.session_state.processing and selected_state and selected_municipality:
-        with st.status("Preparing data...", expanded=True) as status:
-            success = prepare_municipality_data(
-                selected_state,
-                selected_municipality,
-                api_keys
-            )
-            st.session_state.processing = False
-            if success:
-                status.update(label="Ready!", state="complete")
-            else:
-                status.update(label="Failed", state="error")
-        st.rerun()
+                st.session_state.processing = False
+                if success:
+                    status.update(label="Ready!", state="complete")
+                else:
+                    status.update(label="Failed", state="error")
+            st.rerun()
 
     # Status indicator
     if st.session_state.status_message:
